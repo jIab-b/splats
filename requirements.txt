@@ -1,0 +1,10 @@
+numpy
+trimesh
+pyrender
+PyOpenGL
+PyOpenGL-accelerate
+imageio
+Pillow
+networkx
+modal
+huggingface_hub
