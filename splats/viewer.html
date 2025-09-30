@@ -1,0 +1,118 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>3DGS Viewer</title>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #000; }
+    #c { width: 100%; height: 100%; display: block; }
+    #hud { position: absolute; top: 8px; left: 8px; color: #fff; font: 12px sans-serif; background: rgba(0,0,0,0.35); padding: 6px 8px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">RMB rotate, LMB pan, wheel zoom</div>
+<script src="https://unpkg.com/three@0.158.0/build/three.min.js"></script>
+<script src="https://unpkg.com/three@0.158.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+async function loadMeta(){
+  const res = await fetch('viewer_meta.json');
+  if(!res.ok) throw new Error('meta load failed');
+  return await res.json();
+}
+async function loadBin(count){
+  const res = await fetch('viewer_data.bin');
+  const buf = await res.arrayBuffer();
+  const f32 = new Float32Array(buf);
+  const stride = 10; // x y z r g b sx sy sz opacity
+  if(f32.length !== count*stride) console.warn('unexpected length', f32.length, count*stride);
+  return {f32, stride};
+}
+(async function(){
+  const canvas = document.getElementById('c');
+  const renderer = new THREE.WebGLRenderer({canvas, antialias: true});
+  renderer.setPixelRatio(window.devicePixelRatio);
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(50, 2, 0.01, 1000);
+  const controls = new THREE.OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.mouseButtons = { LEFT: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.DOLLY };
+
+  const meta = await loadMeta();
+  const {f32, stride} = await loadBin(meta.count);
+
+  const center = new THREE.Vector3(...meta.center);
+  const rad = meta.radius || 2.0;
+  camera.position.copy(center.clone().add(new THREE.Vector3(rad*1.5, rad*0.8, rad*1.5)));
+  controls.target.copy(center);
+
+  // Use Points with size from scale average; opacity to alpha
+  const pos = new Float32Array(meta.count*3);
+  const col = new Float32Array(meta.count*4);
+  const sizes = new Float32Array(meta.count);
+  for(let i=0;i<meta.count;i++){
+    const o = i*stride;
+    pos[3*i+0] = f32[o+0];
+    pos[3*i+1] = f32[o+1];
+    pos[3*i+2] = f32[o+2];
+    col[4*i+0] = f32[o+3];
+    col[4*i+1] = f32[o+4];
+    col[4*i+2] = f32[o+5];
+    col[4*i+3] = f32[o+9];
+    sizes[i] = (f32[o+6] + f32[o+7] + f32[o+8]) / 3.0;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos,3));
+  geo.setAttribute('color', new THREE.BufferAttribute(col,4));
+  geo.setAttribute('size', new THREE.BufferAttribute(sizes,1));
+
+  const vsh = `
+  attribute float size; 
+  attribute vec4 color; 
+  varying vec4 vColor; 
+  void main(){
+    vColor = color; 
+    vec4 mvPosition = modelViewMatrix * vec4(position,1.0);
+    float s = size * 600.0; // scale factor for visibility
+    gl_PointSize = s / -mvPosition.z; 
+    gl_Position = projectionMatrix * mvPosition;
+  }`;
+  const fsh = `
+  varying vec4 vColor; 
+  void main(){
+    vec2 uv = gl_PointCoord * 2.0 - 1.0;
+    float r2 = dot(uv, uv);
+    float alpha = smoothstep(1.0, 0.0, r2);
+    gl_FragColor = vec4(vColor.rgb, vColor.a * alpha);
+  }`;
+  const mat = new THREE.ShaderMaterial({
+    vertexShader: vsh,
+    fragmentShader: fsh,
+    transparent: true,
+    depthTest: true,
+    blending: THREE.NormalBlending,
+    vertexColors: true
+  });
+  const pts = new THREE.Points(geo, mat);
+  scene.add(pts);
+
+  function resize(){
+    const w = canvas.clientWidth; const h = canvas.clientHeight;
+    if(canvas.width !== w || canvas.height !== h){
+      renderer.setSize(w,h,false);
+      camera.aspect = w/h; camera.updateProjectionMatrix();
+    }
+  }
+  function loop(){
+    resize();
+    controls.update();
+    renderer.render(scene, camera);
+    requestAnimationFrame(loop);
+  }
+  loop();
+})();
+</script>
+</body>
+</html>
+
+

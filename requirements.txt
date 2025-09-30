@@ -1,10 +1,8 @@
+torch
 numpy
-trimesh
-pyrender
-PyOpenGL
-PyOpenGL-accelerate
+pillow
 imageio
-Pillow
+gsplat>=0.1.0
+trimesh
 networkx
-modal
-huggingface_hub
+pygltflib
