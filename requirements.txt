@@ -2,7 +2,11 @@ torch
 numpy
 pillow
 imageio
+imageio-ffmpeg
 gsplat>=0.1.0
 trimesh
 networkx
 pygltflib
+matplotlib
+pytorch3d @ git+https://github.com/facebookresearch/pytorch3d.git@main
+rtree
