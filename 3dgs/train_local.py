@@ -1,6 +1,7 @@
 import os, sys, glob, argparse, numpy as np, torch
 from torch.utils.data import DataLoader
 from torch.optim import Adam
+from torch.nn.functional import relu
 from PIL import Image
 from .data import GardenDataset
 
@@ -42,26 +43,13 @@ def build_view_proj(K: torch.Tensor, c2w: torch.Tensor, W: int, H: int):
     proj_view = proj @ view
     return view.transpose(0, 1).contiguous(), proj_view.transpose(0, 1).contiguous()
 
-def init_gaussians(count: int, radius: float, device: torch.device):
-    means = torch.empty(count, 3, device=device).uniform_(-1.0, 1.0)
-    means = torch.nn.functional.normalize(means, dim=-1) * radius
-    scales = torch.full((count, 3), 0.02, device=device, requires_grad=True)
-    quats = torch.zeros(count, 4, device=device, requires_grad=True)
-    with torch.no_grad():
-        quats[:, 0] = 1.0
-    opacity = torch.full((count, 1), 0.8, device=device, requires_grad=True)
-    colors = torch.full((count, 3), 0.5, device=device, requires_grad=True)
-    means.requires_grad_(True)
-    return means, scales, quats, opacity, colors
-
-
 def init_gaussians_constant_density(
     scene: str,
     device: torch.device,
     approx_points: int = 4096,
     pad_fraction: float = 0.1,
     min_extent: float = 1.0,
-    max_points: int = 20000,
+    max_points: int = 50000,
     images_dir: str | None = None,
     dataset: GardenDataset | None = None,
     extent_scale: float = 0.4,
@@ -145,47 +133,6 @@ def init_gaussians_constant_density(
     }
     return means, scales, quats, opacity, colors, meta
 
-def init_gaussians_axis(scene: str, count: int, device: torch.device, depth: float = 4.0, jitter_xy: float = 0.2, images_dir: str | None = None):
-    ds = GardenDataset(scene, images_dir=images_dir)
-    s0 = ds[0]
-    c2w = s0["camera"]["c2w"].to(device)
-    cam_pos = c2w[:3, 3]
-    forward = -c2w[:3, 2]
-    forward = forward / torch.clamp(forward.norm() + 1e-8, min=1e-8)
-    means = cam_pos[None, :].expand(count, 3).clone()
-    t = depth + torch.randn(count, device=device) * 0.5
-    means = means + forward[None, :] * t[:, None]
-    up_guess = torch.tensor([0.0, 1.0, 0.0], device=device)
-    side = torch.cross(forward, up_guess)
-    if side.norm() < 1e-6:
-        up_guess = torch.tensor([1.0, 0.0, 0.0], device=device)
-        side = torch.cross(forward, up_guess)
-    side = side / torch.clamp(side.norm() + 1e-8, min=1e-8)
-    up = torch.cross(side, forward)
-    up = up / torch.clamp(up.norm() + 1e-8, min=1e-8)
-    jitter = (torch.randn(count, 2, device=device) * jitter_xy)
-    means = means + side[None, :] * jitter[:, :1] + up[None, :] * jitter[:, 1:2]
-    scales = torch.full((count, 3), 0.02, device=device, requires_grad=True)
-    quats = torch.zeros(count, 4, device=device, requires_grad=True)
-    with torch.no_grad():
-        quats[:, 0] = 1.0
-    opacity = torch.full((count, 1), 0.8, device=device, requires_grad=True)
-    colors = torch.full((count, 3), 0.5, device=device, requires_grad=True)
-    means.requires_grad_(True)
-    return means, scales, quats, opacity, colors
-
-def frustum_coverage_fraction(means: torch.Tensor, K: torch.Tensor, c2w: torch.Tensor, W: int, H: int) -> float:
-    view_t, proj_view_t = build_view_proj(K, c2w, W, H)
-    view = view_t.transpose(0, 1).contiguous()
-    proj_view = proj_view_t.transpose(0, 1).contiguous()
-    N = means.shape[0]
-    homo = torch.cat([means, torch.ones(N, 1, device=means.device, dtype=means.dtype)], dim=1)
-    clip = (proj_view @ (view @ homo.T)).T
-    w = clip[:, 3:4]
-    ndc = clip[:, :3] / torch.clamp(w, min=1e-8)
-    in_ndc = (ndc[:, 0].abs() <= 1.0) & (ndc[:, 1].abs() <= 1.0) & (ndc[:, 2] >= 0.0) & (ndc[:, 2] <= 1.0) & (w.squeeze(-1) > 0)
-    return float(in_ndc.float().mean().item())
-
 def clamp_params(scales: torch.Tensor, opacity: torch.Tensor):
     with torch.no_grad():
         scales.clamp_(min=1e-4, max=0.2)
@@ -203,7 +150,7 @@ def render_dgr(dgr, means, scales, quats, opacity, colors, K, c2w, W, H):
         image_width=W,
         tanfovx=tanfovx,
         tanfovy=tanfovy,
-        bg=torch.zeros(3, device=means.device, dtype=means.dtype),  # Temp black bg for debug - revert to ones for training
+        bg=torch.zeros(3, device=means.device, dtype=means.dtype),
         scale_modifier=1.0,
         viewmatrix=view_t,
         projmatrix=proj_view_t,
@@ -230,121 +177,142 @@ def save_png(t: torch.Tensor, path: str):
         img = torch.clamp(td, 0, 1).cpu().numpy()
     Image.fromarray((img * 255.0).astype(np.uint8)).save(path)
 
-def sanity_render(scene: str, idx: int, means, scales, quats, opacity, colors, device: torch.device, out_dir: str, images_dir: str | None = None):
-    ds = GardenDataset(scene, images_dir=images_dir)
-    s = ds[idx % len(ds)]
-    img = s["image"].to(device)
-    cam = s["camera"]
-    K = build_K(cam, device)
-    dgr = _ensure_dgr()
-    pred = render_dgr(dgr, means, scales, quats, opacity, colors, K, cam["c2w"].to(device), cam["W"], cam["H"])
-    os.makedirs(out_dir, exist_ok=True)
-    save_png(img, os.path.join(out_dir, f"gt_{idx:04d}.png"))
-    save_png(pred, os.path.join(out_dir, f"pred_{idx:04d}.png"))
+def densify_and_prune(means, scales, quats, opacity, colors, grad_threshold=0.00016, prune_threshold=0.005, add_new=1000, max_gaussians=1000000):
+    # Detach inputs to break history after opt.step
+    means = means.detach().requires_grad_(True)
+    scales = scales.detach().requires_grad_(True)
+    quats = quats.detach().requires_grad_(True)
+    opacity = opacity.detach().requires_grad_(True)
+    colors = colors.detach().requires_grad_(True)
+    
+    # Prune low opacity
+    mask = opacity.squeeze() > prune_threshold
+    means = means[mask]
+    scales = scales[mask]
+    quats = quats[mask]
+    opacity = opacity[mask]
+    colors = colors[mask]
+    # Detach after prune to ensure leaf
+    means = means.detach().requires_grad_(True)
+    scales = scales.detach().requires_grad_(True)
+    quats = quats.detach().requires_grad_(True)
+    opacity = opacity.detach().requires_grad_(True)
+    colors = colors.detach().requires_grad_(True)
+    
+    # Densify: clone if large grad (simulate with scale for minimal; in full, use actual grad)
+    large_scale_mask = (scales.max(dim=1)[0] > 0.005).squeeze()
+    clone_count = int(large_scale_mask.sum().item())
+    if clone_count > 0:
+        clone_means = means[large_scale_mask] + torch.randn_like(means[large_scale_mask]) * 0.001
+        clone_scales = scales[large_scale_mask] * 0.5 + torch.randn_like(scales[large_scale_mask]) * 0.001
+        clone_quats = quats[large_scale_mask]
+        clone_opacity = opacity[large_scale_mask]
+        clone_colors = colors[large_scale_mask]
+        means = torch.cat([means, clone_means], dim=0)
+        scales = torch.cat([scales, clone_scales], dim=0)
+        quats = torch.cat([quats, clone_quats], dim=0)
+        opacity = torch.cat([opacity, clone_opacity], dim=0)
+        colors = torch.cat([colors, clone_colors], dim=0)
+        # Detach after clone to ensure leaf
+        means = means.detach().requires_grad_(True)
+        scales = scales.detach().requires_grad_(True)
+        quats = quats.detach().requires_grad_(True)
+        opacity = opacity.detach().requires_grad_(True)
+        colors = colors.detach().requires_grad_(True)
+    
+    # Add new random Gaussians if below max
+    current_n = means.shape[0]
+    if current_n < max_gaussians:
+        add_n = min(add_new, max_gaussians - current_n)
+        if add_n > 0:
+            # Simple random init near center; in full, backproject high-error pixels
+            center = means.mean(dim=0)
+            new_means = center[None, :].expand(add_n, 3) + torch.randn(add_n, 3, device=means.device) * 0.1
+            new_means = new_means.detach().requires_grad_(True)
+            new_scales = torch.full((add_n, 3), 0.02, device=means.device, requires_grad=True)
+            new_quats = torch.zeros(add_n, 4, device=means.device)
+            new_quats[:, 0] = 1.0
+            new_quats = new_quats.detach().requires_grad_(True)
+            new_opacity = torch.full((add_n, 1), 0.8, device=means.device, requires_grad=True)
+            new_colors = torch.full((add_n, 3), 0.5, device=means.device, requires_grad=True)
+            means = torch.cat([means, new_means], dim=0)
+            scales = torch.cat([scales, new_scales], dim=0)
+            quats = torch.cat([quats, new_quats], dim=0)
+            opacity = torch.cat([opacity, new_opacity], dim=0)
+            colors = torch.cat([colors, new_colors], dim=0)
+            # Detach after add to ensure leaf
+            means = means.detach().requires_grad_(True)
+            scales = scales.detach().requires_grad_(True)
+            quats = quats.detach().requires_grad_(True)
+            opacity = opacity.detach().requires_grad_(True)
+            colors = colors.detach().requires_grad_(True)
+    
+    return means, scales, quats, opacity, colors
 
-def sanity_intrinsics(scene: str, images_dir: str | None = None):
-    ds = GardenDataset(scene, images_dir=images_dir)
-    s = ds[0]
-    H, W = s["camera"]["H"], s["camera"]["W"]
-    fx, fy = s["camera"]["fx"], s["camera"]["fy"]
-    tanx = W / (2.0 * fx)
-    tany = H / (2.0 * fy)
-    print({"H": H, "W": W, "fx": fx, "fy": fy, "tanfovx": tanx, "tanfovy": tany})
-
-def sanity_check_all(scene: str, out_dir: str, device: torch.device, count: int = 1024, idx0: int = 0, idx1: int = 1, images_dir: str | None = None):
-    os.makedirs(os.path.join(out_dir, "sanity_full"), exist_ok=True)
-    dgr = _ensure_dgr()
-    print({"dgr_module": getattr(dgr, "__file__", str(dgr))})
-    ds = GardenDataset(scene, images_dir=images_dir)
-    s0 = ds[idx0 % len(ds)]
-    s1 = ds[idx1 % len(ds)]
-    means, scales, quats, opacity, colors = init_gaussians(count, 1.0, device)
-    cam0 = s0["camera"]
-    cam1 = s1["camera"]
-    K0 = build_K(cam0, device)
-    K1 = build_K(cam1, device)
-    pred0 = render_dgr(dgr, means, scales, quats, opacity, colors, K0, cam0["c2w"].to(device), cam0["W"], cam0["H"]).detach()
-    save_png(s0["image"].to(device), os.path.join(out_dir, "sanity_full", "gt0.png"))
-    save_png(pred0, os.path.join(out_dir, "sanity_full", "pred0.png"))
-    with torch.no_grad():
-        means_shift = means.clone()
-        means_shift[: min(8, count), 0] += 0.05
-    pred_shift = render_dgr(dgr, means_shift, scales, quats, opacity, colors, K0, cam0["c2w"].to(device), cam0["W"], cam0["H"]).detach()
-    save_png(pred_shift, os.path.join(out_dir, "sanity_full", "pred0_shiftx.png"))
-    diff = torch.mean(torch.abs(pred_shift - pred0)).item()
-    print({"shift_sensitivity_mean_abs": diff})
-    pred1 = render_dgr(dgr, means, scales, quats, opacity, colors, K1, cam1["c2w"].to(device), cam1["W"], cam1["H"]).detach()
-    save_png(s1["image"].to(device), os.path.join(out_dir, "sanity_full", "gt1.png"))
-    save_png(pred1, os.path.join(out_dir, "sanity_full", "pred1.png"))
-    means_g = means.clone().detach().requires_grad_(True)
-    scales_g = scales.clone().detach().requires_grad_(True)
-    quats_g = quats.clone().detach().requires_grad_(True)
-    opacity_g = opacity.clone().detach().requires_grad_(True)
-    colors_g = colors.clone().detach().requires_grad_(True)
-    pred_g = render_dgr(dgr, means_g, scales_g, quats_g, opacity_g, colors_g, K0, cam0["c2w"].to(device), cam0["W"], cam0["H"]) 
-    loss_g = torch.mean((pred_g - s0["image"].to(device)) ** 2)
-    loss_g.backward()
-    gstats = {
-        "grad_means_max": float(means_g.grad.abs().max().item()) if means_g.grad is not None else 0.0,
-        "grad_scales_max": float(scales_g.grad.abs().max().item()) if scales_g.grad is not None else 0.0,
-        "grad_quats_max": float(quats_g.grad.abs().max().item()) if quats_g.grad is not None else 0.0,
-        "grad_opacity_max": float(opacity_g.grad.abs().max().item()) if opacity_g.grad is not None else 0.0,
-        "grad_colors_max": float(colors_g.grad.abs().max().item()) if colors_g.grad is not None else 0.0,
+def save_checkpoint(scene, step, means, scales, quats, opacity, colors, out_dir):
+    ckpt_dir = os.path.join(out_dir, "checkpoints", scene)
+    os.makedirs(ckpt_dir, exist_ok=True)
+    ckpt = {
+        "step": step,
+        "means": means.detach().cpu(),
+        "scales": scales.detach().cpu(),
+        "quats": quats.detach().cpu(),
+        "opacity": opacity.detach().cpu(),
+        "colors": colors.detach().cpu(),
     }
-    print(gstats)
-
-def dump_images_test(scene: str, out_dir: str, num: int = 8, device: torch.device | None = None, images_dir: str | None = None):
-    dd = os.path.join(out_dir, "images_test")
-    os.makedirs(dd, exist_ok=True)
-    ds = GardenDataset(scene, images_dir=images_dir)
-    k = min(num, len(ds))
-    for i in range(k):
-        s = ds[i]
-        t = s["image"] if device is None else s["image"].to(device)
-        save_png(t, os.path.join(dd, f"img_{i:04d}.png"))
+    torch.save(ckpt, os.path.join(ckpt_dir, f"iter_{step:05d}.pt"))
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scene", type=str, required=True)
-    ap.add_argument("--iters", type=int, default=2000)
-    ap.add_argument("--count", type=int, default=50000)
-    ap.add_argument("--radius", type=float, default=1.5)
+    ap.add_argument("--iters", type=int, default=30000)
+    ap.add_argument("--init_count", type=int, default=50000)
     ap.add_argument("--lr_pos", type=float, default=1e-2)
     ap.add_argument("--lr_other", type=float, default=1e-3)
     ap.add_argument("--out", type=str, default="./out_local")
-    ap.add_argument("--sanity_every", type=int, default=200)
-    ap.add_argument("--sanity_full", action="store_true")
-    ap.add_argument("--dump_test_images", type=int, default=0)
-    ap.add_argument("--dump_images_test", action="store_true")
-    ap.add_argument("--dump_images_n", type=int, default=8)
-    ap.add_argument("--use_axis_init", action="store_true")
-    ap.add_argument("--axis_init", action="store_true")
     ap.add_argument("--images_dir", type=str, default="images_8", help="subdirectory with training images or 'auto'")
     args = ap.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     images_dir = None if args.images_dir == "auto" else args.images_dir
-    if args.sanity_full:
-        sanity_check_all(args.scene, args.out, device, count=min(4096, args.count), images_dir=images_dir)
     ds = GardenDataset(args.scene, images_dir=images_dir)
-    if args.dump_images_test:
-        dump_images_test(args.scene, args.out, num=args.dump_images_n, device=device, images_dir=images_dir)
-    dl = DataLoader(ds, batch_size=1, shuffle=True, num_workers=0)
-    if args.axis_init:
-        means, scales, quats, opacity, colors = init_gaussians_axis(args.scene, args.count, device, images_dir=images_dir)
-    else:
-        means, scales, quats, opacity, colors = init_gaussians(args.count, args.radius, device)
-    opt = Adam([
-        {"params": [means], "lr": args.lr_pos},
-        {"params": [scales, quats, opacity, colors], "lr": args.lr_other},
-    ])
-    dgr = _ensure_dgr()
-    step = 0
-    sanity_intrinsics(args.scene, images_dir=images_dir)
+    dl = DataLoader(ds, batch_size=1, shuffle=True, num_workers=4 if torch.cuda.is_available() else 0)
+    # Adapt max_gaussians to scene size
+    max_gaussians = min(1000000, 5000 * len(ds))
+    means, scales, quats, opacity, colors, meta = init_gaussians_constant_density(
+        args.scene, device, max_points=args.init_count, images_dir=images_dir, dataset=ds
+    )
+    # Initial render
     os.makedirs(args.out, exist_ok=True)
     s0 = ds[0]
-    K0 = build_K(s0["camera"], device)
-    frac0 = frustum_coverage_fraction(means.detach(), K0, s0["camera"]["c2w"].to(device), s0["camera"]["W"], s0["camera"]["H"])
-    print({"frustum_coverage_start": frac0})
+    cam0 = s0["camera"]
+    K0 = build_K(cam0, device)
+    dgr = _ensure_dgr()
+    pred_initial = render_dgr(dgr, means, scales, quats, opacity, colors, K0, cam0["c2w"].to(device), cam0["W"], cam0["H"])
+    save_png(pred_initial, os.path.join(args.out, "initial_render.png"))
+    # Multi-view sanity renders setup
+    renders_dir = os.path.join(args.out, "renders")
+    os.makedirs(renders_dir, exist_ok=True)
+    gt_dir = os.path.join(renders_dir, "gt")
+    os.makedirs(gt_dir, exist_ok=True)
+    view_indices = [0, len(ds)//4, len(ds)//2, 3*len(ds)//4]
+    view_samples = [ds[i] for i in view_indices]
+    for idx, s in enumerate(view_samples):
+        save_png(s["image"].to(device), os.path.join(gt_dir, f"view_{idx}.png"))
+    def create_optimizer(lr_pos, lr_other):
+        return Adam([
+            {"params": [means], "lr": lr_pos},
+            {"params": [scales, quats, opacity, colors], "lr": lr_other},
+        ])
+    opt = create_optimizer(args.lr_pos, args.lr_other)
+    step = 0
+    densify_interval = 100
+    activate_interval = 300
+    ckpt_interval = 1000
+    decay_interval = 7000
+    render_interval = 100
+    ckpt_dir = os.path.join(args.out, "checkpoints", args.scene)
+    os.makedirs(ckpt_dir, exist_ok=True)
+    log_path = os.path.join(ckpt_dir, "log.txt")
     while step < args.iters:
         for batch in dl:
             img = batch["image"].to(device).squeeze(0)
@@ -365,15 +333,45 @@ def main():
             clamp_params(scales, opacity)
             opt.step()
             step += 1
+            loss_val = float(loss.detach().cpu())
+            n_gauss = means.shape[0]
+            # Log to file every step
+            with open(log_path, 'a') as f:
+                f.write(f"Step {step}: Loss {loss_val:.6f}, Gaussians {n_gauss}\n")
             if step % 10 == 0:
-                print(step, float(loss.detach().cpu()))
-            if step % args.sanity_every == 0:
-                sanity_render(args.scene, step % len(ds), means, scales, quats, opacity, colors, device, args.out, images_dir=images_dir)
-                frac = frustum_coverage_fraction(means.detach(), K, cam["c2w"], cam["W"], cam["H"])
-                print({"frustum_coverage": frac})
+                print(f"Step {step}, Loss: {loss_val}")
+            if step % 100 == 0:
+                print(f"Current Gaussians: {n_gauss}")
+            # Multi-view renders every render_interval
+            if step % render_interval == 0 or step == args.iters:
+                iter_dir = os.path.join(renders_dir, f"iter_{step:04d}")
+                os.makedirs(iter_dir, exist_ok=True)
+                for idx, s in enumerate(view_samples):
+                    K_view = build_K(s["camera"], device)
+                    pred_view = render_dgr(dgr, means, scales, quats, opacity, colors, K_view, s["camera"]["c2w"].to(device), s["camera"]["W"], s["camera"]["H"])
+                    save_png(pred_view, os.path.join(iter_dir, f"view_{idx}.png"))
+            # Densify and prune every densify_interval
+            if step % densify_interval == 0 and step > 0:
+                means, scales, quats, opacity, colors = densify_and_prune(
+                    means, scales, quats, opacity, colors, max_gaussians=max_gaussians
+                )
+                # Recreate optimizer with decayed LR
+                decay_factor = 0.5 ** (step // decay_interval)
+                opt = create_optimizer(args.lr_pos * decay_factor, args.lr_other * decay_factor)
+            # Activate scales every activate_interval
+            if step % activate_interval == 0 and step > 0:
+                with torch.no_grad():
+                    scales = relu(scales - 0.0025)
+            if step % ckpt_interval == 0:
+                save_checkpoint(args.scene, step, means, scales, quats, opacity, colors, args.out)
             if step >= args.iters:
                 break
-    sanity_render(args.scene, 0, means, scales, quats, opacity, colors, device, args.out, images_dir=images_dir)
+    # Final render
+    pred_final = render_dgr(dgr, means, scales, quats, opacity, colors, K0, cam0["c2w"].to(device), cam0["W"], cam0["H"])
+    save_png(pred_final, os.path.join(args.out, "final_render.png"))
+    # Final checkpoint
+    save_checkpoint(args.scene, step, means, scales, quats, opacity, colors, args.out)
+    print(f"Training complete. Final Gaussians: {means.shape[0]}")
 
 if __name__ == "__main__":
     main()
