@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://some_uid_here"]
+
+[ext_resource type="Script" path="res://godot_stuff/auto_capture.gd" id="1_auto_capture"]
+
+[node name="AutoCapture" type="Node3D"]
+script = ExtResource("1_auto_capture")

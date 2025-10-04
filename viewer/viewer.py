@@ -12,6 +12,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, List, Mapping, Optional
+import subprocess
 
 try:
     import imageio.v2 as iio
@@ -295,6 +296,9 @@ class SceneDatabase:
                 timestamp REAL,
                 split TEXT,
                 frame_path TEXT,
+                depth_path TEXT,
+                normal_path TEXT,
+                albedo_path TEXT,
                 PRIMARY KEY (scene_id, view_index),
                 FOREIGN KEY (scene_id) REFERENCES scenes(id) ON DELETE CASCADE
             );
@@ -404,8 +408,9 @@ class SceneDatabase:
             INSERT INTO views (
                 scene_id, view_index, pose, coverage, distance,
                 fx, fy, cx, cy, width, height, near, far,
-                exposure, timestamp, split, frame_path
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                exposure, timestamp, split, frame_path,
+                depth_path, normal_path, albedo_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 (
@@ -426,6 +431,9 @@ class SceneDatabase:
                     view.get("timestamp"),
                     view.get("split"),
                     view.get("frame_path"),
+                    view.get("depth_path"),
+                    view.get("normal_path"),
+                    view.get("albedo_path"),
                 )
                 for view in views
             ),
@@ -506,31 +514,30 @@ def generate_transforms(
     frames = []
     for view in views:
         frame_name = f"images/view_{view.index:04d}.png"
-        frames.append(
-            {
-                "file_path": frame_name,
-                "transform_world_from_cam": view.transform,
-                "intrinsics": {
-                    "fx": fx,
-                    "fy": fy,
-                    "cx": cx,
-                    "cy": cy,
-                    "width": width,
-                    "height": height,
-                },
-                "distortion": {
-                    "k1": 0.0,
-                    "k2": 0.0,
-                    "p1": 0.0,
-                    "p2": 0.0,
-                    "k3": 0.0,
-                },
-                "near": near,
-                "far": far,
-                "exposure_ev": exposure_ev,
-                "timestamp": view.timestamp,
-            }
-        )
+        frame = {
+            "file_path": frame_name,
+            "transform_world_from_cam": view.transform,
+            "intrinsics": {
+                "fx": fx,
+                "fy": fy,
+                "cx": cx,
+                "cy": cy,
+                "width": width,
+                "height": height,
+            },
+            "distortion": {
+                "k1": 0.0,
+                "k2": 0.0,
+                "p1": 0.0,
+                "p2": 0.0,
+                "k3": 0.0,
+            },
+            "near": near,
+            "far": far,
+            "exposure_ev": exposure_ev,
+            "timestamp": view.timestamp,
+        }
+        frames.append(frame)
     transforms = {
         "schema": schema_version,
         "camera_model": "pinhole",
@@ -566,7 +573,7 @@ def write_conventions(
 def write_provenance(scene_root: Path, *, source_gltf: Path) -> None:
     payload = {
         "source_gltf": str(source_gltf),
-        "generated_at": _dt.datetime.utcnow().isoformat() + "Z",
+        "generated_at": _dt.datetime.now(_dt.timezone.utc).isoformat().removesuffix("+00:00") + "Z",
     }
     _write_json(scene_root / "metadata" / "provenance.json", payload)
 
@@ -575,11 +582,12 @@ def write_stats(scene_root: Path, stats: Mapping[str, object]) -> None:
     _write_json(scene_root / "metadata" / "stats.json", stats)
 
 
-def write_manifest(scene_root: Path, total_frames: int) -> Mapping[str, List[str]]:
-    paths = [f"images/view_{idx:04d}.png" for idx in range(total_frames)]
-    payload = {"all": paths}
-    _write_json(scene_root / "manifest.json", payload)
-    _write_json(scene_root / "metadata" / "manifest.json", payload)
+def write_manifest(scene_root: Path, total_frames: int, split_name: str = "all", base_dir: str = "images", ext: str = ".png") -> Mapping[str, List[str]]:
+    paths = [f"{base_dir}/view_{idx:04d}{ext}" for idx in range(total_frames)]
+    payload = {split_name: paths}
+    manifest_path = scene_root / f"{split_name}_manifest.json"
+    _write_json(manifest_path, payload)
+    _write_json(scene_root / "metadata" / f"{split_name}_manifest.json", payload)
     return payload
 
 
@@ -628,6 +636,15 @@ def harvest_scene(args: argparse.Namespace) -> None:
     scene_root = args.output.resolve()
     scene_root.mkdir(parents=True, exist_ok=True)
     (scene_root / "images").mkdir(exist_ok=True)
+    metadata_dir = scene_root / "metadata"
+    metadata_dir.mkdir(exist_ok=True)
+
+    if args.enable_depth:
+        (scene_root / "depth").mkdir(exist_ok=True)
+    if args.enable_normals:
+        (scene_root / "normals").mkdir(exist_ok=True)
+    if args.enable_albedo:
+        (scene_root / "albedo").mkdir(exist_ok=True)
 
     copy_gltf_assets(gltf_dir, scene_root / "gltf")
     write_provenance(scene_root, source_gltf=gltf_file)
@@ -693,13 +710,31 @@ def harvest_scene(args: argparse.Namespace) -> None:
         },
     )
     write_exposures(scene_root, len(views), args.exposure_ev)
-    manifest = write_manifest(scene_root, len(views))
+
+    # Write RGB manifest
+    manifest = write_manifest(scene_root, len(views), "all", "images", ".png")
+
+    # Write auxiliary manifests if enabled
+    if args.enable_depth:
+        write_manifest(scene_root, len(views), "depth", "depth", ".exr")
+    if args.enable_normals:
+        write_manifest(scene_root, len(views), "normals", "normals", ".exr")
+    if args.enable_albedo:
+        write_manifest(scene_root, len(views), "albedo", "albedo", ".png")
 
     for obsolete in [scene_root / "splits.json", scene_root / "metadata" / "splits.json"]:
         if obsolete.exists():
             obsolete.unlink()
 
-    db = SceneDatabase(args.sqlite.resolve())
+    # Set DB path to per-scene if not provided
+    if args.sqlite is None:
+        db_path = metadata_dir / "splatdb_meta.db"
+    else:
+        db_path = args.sqlite.resolve()
+        if str(db_path) == "metadata/splatdb_meta.db":  # Legacy default
+            db_path = metadata_dir / "splatdb_meta.db"
+
+    db = SceneDatabase(db_path)
     scene_id = db.upsert_scene(
         name=args.scene_name,
         scene_root=scene_root,
@@ -724,6 +759,9 @@ def harvest_scene(args: argparse.Namespace) -> None:
     view_rows = []
     for v in views:
         frame_path = f"images/view_{v.index:04d}.png"
+        depth_path = f"depth/view_{v.index:04d}.exr" if args.enable_depth else None
+        normal_path = f"normals/view_{v.index:04d}.exr" if args.enable_normals else None
+        albedo_path = f"albedo/view_{v.index:04d}.png" if args.enable_albedo else None
         view_rows.append(
             {
                 "index": v.index,
@@ -742,15 +780,108 @@ def harvest_scene(args: argparse.Namespace) -> None:
                 "timestamp": v.timestamp,
                 "split": "all",
                 "frame_path": frame_path,
+                "depth_path": depth_path,
+                "normal_path": normal_path,
+                "albedo_path": albedo_path,
             }
         )
     db.set_views(scene_id, view_rows)
+
+    # Update transforms with auxiliary paths if enabled
+    transforms_path = scene_root / "metadata" / "transforms.json"
+    with transforms_path.open("r") as f:
+        transforms_data = json.load(f)
+    for i, frame in enumerate(transforms_data["frames"]):
+        if args.enable_depth:
+            frame["depth_path"] = view_rows[i]["depth_path"]
+        if args.enable_normals:
+            frame["normal_path"] = view_rows[i]["normal_path"]
+        if args.enable_albedo:
+            frame["albedo_path"] = view_rows[i]["albedo_path"]
+    _write_json(transforms_path, transforms_data)
 
     (scene_root / "version.txt").write_text(f"{args.schema}\n")
 
     print(
         f"Harvest complete: {len(views)} planned views written to {scene_root / 'metadata' / 'transforms.json'}"
     )
+
+    # Render if requested
+    if args.render:
+        if not shutil.which("blender"):
+            print("Blender not found on PATH. Install Blender and ensure 'blender' is executable.", file=sys.stderr)
+            print("Alternatively, render manually using the generated transforms.json.", file=sys.stderr)
+            return
+
+        gltf_abs = scene_root / "gltf" / "scene.gltf"
+        script_path = Path(__file__).resolve().parent / "blender_render.py"
+        if not script_path.exists():
+            print(
+                f"Blender helper script not found at {script_path}; cannot render.",
+                file=sys.stderr,
+            )
+            return
+
+        engine_map = {"eevee": "BLENDER_EEVEE", "cycles": "CYCLES"}
+        engine = engine_map.get(args.render_engine, "BLENDER_EEVEE")
+        hdri_path = args.render_hdri.resolve() if args.render_hdri else None
+
+        blender_cmd = [
+            "blender",
+            "--background",
+            "--python",
+            str(script_path),
+            "--",
+            "--scene-root",
+            str(scene_root),
+            "--transforms",
+            str(scene_root / "metadata" / "transforms.json"),
+            "--gltf",
+            str(gltf_abs),
+            "--engine",
+            engine,
+            "--samples",
+            str(max(1, args.render_samples)),
+            "--sun-energy",
+            str(args.render_sun_energy),
+            "--sun-azimuth",
+            str(args.render_sun_azimuth),
+            "--sun-elevation",
+            str(args.render_sun_elevation),
+            "--env-strength",
+            str(args.render_env_strength),
+        ]
+
+        if args.enable_depth:
+            blender_cmd.append("--enable-depth")
+        if args.enable_normals:
+            blender_cmd.append("--enable-normals")
+        if args.render_env_color is not None:
+            blender_cmd.append("--env-color")
+            blender_cmd.extend(str(float(c)) for c in args.render_env_color)
+        if hdri_path:
+            blender_cmd.extend(["--hdri", str(hdri_path)])
+        if engine == "CYCLES" and args.render_denoise:
+            blender_cmd.append("--enable-denoise")
+
+        try:
+            print("Starting Blender render...")
+            result = subprocess.run(blender_cmd, check=True, capture_output=True, text=True)
+            if result.stdout:
+                print(result.stdout)
+            if result.stderr:
+                print(result.stderr, file=sys.stderr)
+            print("Rendering finished. Check images/, depth/, normals/ dirs.")
+        except subprocess.CalledProcessError as e:
+            print(f"Blender render failed: {e}", file=sys.stderr)
+            if e.stdout:
+                print(e.stdout, file=sys.stderr)
+            if e.stderr:
+                print(e.stderr, file=sys.stderr)
+        except FileNotFoundError:
+            print("Blender executable not found. Ensure Blender is installed and on PATH.", file=sys.stderr)
+
+
 
 
 # Preview ---------------------------------------------------------------------
@@ -766,22 +897,117 @@ def _load_json(path: Path) -> Mapping:
         raise SystemExit(f"Invalid JSON in {path}: {exc}") from exc
 
 
-def _resolve_frames(scene_root: Path, transforms: Mapping) -> List[FrameReference]:
+_FREEIMAGE_READY = False
+
+
+def _read_exr(path: Path) -> np.ndarray:
+    global _FREEIMAGE_READY
+    try:
+        return iio.imread(path, format="EXR-FI")  # Prefer FreeImage plugin
+    except Exception:
+        if not _FREEIMAGE_READY:
+            try:
+                from imageio.plugins import freeimage
+
+                freeimage.download()
+                _FREEIMAGE_READY = True
+                return iio.imread(path, format="EXR-FI")
+            except Exception:
+                _FREEIMAGE_READY = True
+        try:
+            return iio.imread(path, format="EXR")
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to read EXR {path}. Install imageio's EXR support (pip install imageio[full])."
+            ) from exc
+
+
+def _move_channel_axis_last(data: np.ndarray) -> np.ndarray:
+    if data.ndim == 3 and data.shape[0] in (1, 3) and data.shape[-1] not in (1, 3):
+        return np.transpose(data, (1, 2, 0))
+    return data
+
+
+def _ensure_three_channels(image: np.ndarray) -> np.ndarray:
+    if image.ndim == 2:
+        return np.repeat(image[..., None], 3, axis=2)
+    if image.ndim == 3 and image.shape[2] == 1:
+        return np.repeat(image, 3, axis=2)
+    if image.ndim == 3 and image.shape[2] > 3:
+        return image[:, :, :3]
+    return image
+
+
+def _to_uint8(image: np.ndarray) -> np.ndarray:
+    arr = np.asarray(image)
+    if np.issubdtype(arr.dtype, np.floating):
+        with np.errstate(invalid="ignore"):
+            max_val = float(np.nanmax(arr)) if arr.size else 0.0
+        scale = 255.0
+        if np.isfinite(max_val) and max_val > 1.0:
+            scale = 255.0 / max(1.0, max_val)
+        arr = np.clip(arr * scale, 0.0, 255.0).astype(np.uint8)
+    elif arr.dtype == np.uint16:
+        arr = (arr / 257).astype(np.uint8)
+    elif arr.dtype != np.uint8:
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    return arr
+
+
+def _prepare_preview_image(path: Path, kind: str) -> np.ndarray:
+    if kind == "rgb":
+        image = iio.imread(path)
+        image = _move_channel_axis_last(np.asarray(image))
+        image = _to_uint8(image)
+        image = _ensure_three_channels(image)
+        return np.ascontiguousarray(image)
+    if kind == "depth":
+        data = _read_exr(path)
+        data = _move_channel_axis_last(np.asarray(data, dtype=np.float32))
+        if data.ndim == 3:
+            data = data[..., 0]
+        finite_mask = np.isfinite(data)
+        if not finite_mask.any():
+            normalised = np.zeros_like(data, dtype=np.float32)
+        else:
+            valid = data[finite_mask]
+            min_val = float(valid.min())
+            max_val = float(valid.max())
+            if max_val - min_val <= 1e-8:
+                normalised = np.full_like(data, 0.5, dtype=np.float32)
+            else:
+                normalised = np.clip((data - min_val) / (max_val - min_val), 0.0, 1.0)
+        image = (normalised * 255.0).astype(np.uint8)
+        image = _ensure_three_channels(image)
+        return np.ascontiguousarray(image)
+    if kind == "normal":
+        data = _read_exr(path)
+        data = _move_channel_axis_last(np.asarray(data, dtype=np.float32))
+        if data.ndim == 2:
+            data = data[..., None]
+        image = ((data * 0.5) + 0.5) * 255.0
+        image = np.clip(image, 0.0, 255.0).astype(np.uint8)
+        image = _ensure_three_channels(image)
+        return np.ascontiguousarray(image)
+    raise ValueError(f"Unsupported preview kind '{kind}'")
+
+
+def _resolve_frames(scene_root: Path, transforms: Mapping, frame_key: str) -> List[FrameReference]:
     frames_data = transforms.get("frames", [])
     if not frames_data:
         raise SystemExit("No frames found in transforms.json")
 
     resolved: List[FrameReference] = []
     for idx, frame in enumerate(frames_data):
-        file_path_value = frame.get("file_path")
+        file_path_value = frame.get(frame_key)
         if not file_path_value:
-            print(f"Warning: frame {idx} missing file_path; skipping", file=sys.stderr)
+            print(f"Warning: frame {idx} missing {frame_key}; skipping", file=sys.stderr)
             continue
         rel_path = Path(file_path_value)
         abs_path = rel_path if rel_path.is_absolute() else scene_root / rel_path
         if not abs_path.exists():
             print(
-                f"Warning: frame {idx} image not found at {abs_path}; skipping",
+                f"Warning: frame {idx} asset not found at {abs_path}; skipping",
                 file=sys.stderr,
             )
             continue
@@ -793,21 +1019,28 @@ def _resolve_frames(scene_root: Path, transforms: Mapping) -> List[FrameReferenc
             )
         )
     if not resolved:
-        raise SystemExit("No valid frames resolved; nothing to do.")
+        raise SystemExit(f"No valid frames resolved for key '{frame_key}'.")
     return resolved
 
 
-def _tag_frames_with_manifest(frames: List[FrameReference], manifest: Mapping[str, List[str]]) -> None:
-    paths = manifest.get("all", [])
+def _tag_frames_with_manifest(
+    frames: List[FrameReference], manifest: Mapping[str, List[str]], split_name: str
+) -> None:
+    paths = manifest.get(split_name, [])
     lookup = {fr.rel_path.as_posix(): fr for fr in frames}
     for entry in paths:
         entry_key = Path(entry).as_posix()
         target = lookup.get(entry_key)
         if target is not None:
-            target.splits.add("all")
+            target.splits.add(split_name)
 
 
-def _write_video(frame_paths: Iterable[FrameReference], output_path: Path, fps: int) -> int:
+def _write_video(
+    frame_paths: Iterable[FrameReference],
+    output_path: Path,
+    fps: int,
+    kind: str,
+) -> int:
     selection = list(frame_paths)
     if not selection:
         print(f"Skipping {output_path.name}: no frames in selection", file=sys.stderr)
@@ -819,7 +1052,7 @@ def _write_video(frame_paths: Iterable[FrameReference], output_path: Path, fps: 
         with iio.get_writer(str(output_path), fps=fps) as writer:
             for frame in selection:
                 try:
-                    image = iio.imread(frame.abs_path)
+                    image = _prepare_preview_image(frame.abs_path, kind)
                 except Exception as exc:  # pragma: no cover
                     print(
                         f"Warning: failed to read {frame.abs_path}: {exc}; skipping frame",
@@ -845,29 +1078,55 @@ def _write_video(frame_paths: Iterable[FrameReference], output_path: Path, fps: 
     return frame_count
 
 
-def build_previews(scene_root: Path, output_dir: Path, fps: int, db_path: Optional[Path]) -> None:
+PREVIEW_CONFIG = {
+    "rgb": {
+        "frame_key": "file_path",
+        "manifest": "all",
+        "split": "all",
+        "output_prefix": "rgb",
+        "video_name": "preview_all.mp4",
+    },
+    "depth": {
+        "frame_key": "depth_path",
+        "manifest": "depth",
+        "split": "depth",
+        "output_prefix": "depth",
+        "video_name": "preview_depth.mp4",
+    },
+    "normal": {
+        "frame_key": "normal_path",
+        "manifest": "normals",
+        "split": "normals",
+        "output_prefix": "normal",
+        "video_name": "preview_normal.mp4",
+    },
+}
+
+
+def build_previews(
+    scene_root: Path,
+    output_dir: Path,
+    fps: int,
+    db_path: Optional[Path],
+    preview_types: Iterable[str],
+    num_images: Optional[int] = None,
+) -> None:
     transforms_path = scene_root / "metadata" / "transforms.json"
     transforms = _load_json(transforms_path)
-    frames = _resolve_frames(scene_root, transforms)
 
-    manifest_path = scene_root / "metadata" / "manifest.json"
-    if manifest_path.exists():
-        manifest = _load_json(manifest_path)
-    else:
-        manifest = {"all": [fr.rel_path.as_posix() for fr in frames]}
-    _tag_frames_with_manifest(frames, manifest)
-
-    selection = [fr for fr in frames if "all" in fr.splits] or frames
-    if not selection:
-        print("Nothing to render", file=sys.stderr)
+    preview_types = list(preview_types)
+    if not preview_types:
+        print("No preview types requested; nothing to do.", file=sys.stderr)
         return
 
-    db = SceneDatabase(db_path) if db_path else None
-    scene_id = None
-    if db:
-        scene_name = scene_root.name
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    db: Optional[SceneDatabase] = None
+    scene_id: Optional[int] = None
+    if db_path:
+        db = SceneDatabase(db_path)
         scene_id = db.upsert_scene(
-            name=scene_name,
+            name=scene_root.name,
             scene_root=scene_root,
             gltf_path=scene_root / "gltf" / "scene.gltf",
             schema_version=transforms.get("schema", "unknown"),
@@ -879,20 +1138,73 @@ def build_previews(scene_root: Path, output_dir: Path, fps: int, db_path: Option
             bbox_max=[0, 0, 0],
             bounding_radius=0.0,
         )
-        db.clear_previews(scene_id)
 
-    target = output_dir / "preview_all.mp4"
-    frames_written = _write_video(selection, target, fps)
-    if db and scene_id is not None:
-        db.record_preview(scene_id, "all", target, fps, frames_written)
+    capped_images = num_images if num_images and num_images > 0 else None
+
+    for requested in preview_types:
+        config = PREVIEW_CONFIG.get(requested)
+        if config is None:
+            print(f"Unknown preview type '{requested}'; skipping", file=sys.stderr)
+            continue
+
+        try:
+            frames = _resolve_frames(scene_root, transforms, config["frame_key"])
+        except SystemExit as exc:
+            print(str(exc), file=sys.stderr)
+            continue
+
+        manifest_name = config["manifest"]
+        manifest_path = scene_root / "metadata" / f"{manifest_name}_manifest.json"
+        if manifest_path.exists():
+            manifest = _load_json(manifest_path)
+        else:
+            if requested != "rgb":
+                print(f"No {manifest_name} manifest; skipping", file=sys.stderr)
+                continue
+            manifest = {config["split"]: [fr.rel_path.as_posix() for fr in frames]}
+
+        _tag_frames_with_manifest(frames, manifest, config["split"])
+        selection = [fr for fr in frames if config["split"] in fr.splits] or frames
+        if not selection:
+            print(f"Nothing to render for {requested}", file=sys.stderr)
+            continue
+
+        if capped_images is not None:
+            selection = selection[:capped_images]
+            for frame in selection:
+                try:
+                    image = _prepare_preview_image(frame.abs_path, requested)
+                except Exception as exc:
+                    print(
+                        f"Warning: failed to read/write {frame.abs_path}: {exc}; skipping frame",
+                        file=sys.stderr,
+                    )
+                    continue
+                output_path = output_dir / f"preview_{config['output_prefix']}_{frame.index:04d}.png"
+                iio.imwrite(str(output_path), image)
+                print(f"Wrote static preview: {output_path}")
+        else:
+            target = output_dir / config["video_name"]
+            frames_written = _write_video(selection, target, fps, requested)
+            if db and frames_written:
+                db.record_preview(scene_id, config["split"], target, fps, frames_written)
 
 
 def export_frame_detail_command(args: argparse.Namespace) -> None:
     scene_root = args.scene_root.resolve()
     transforms = _load_json(scene_root / "metadata" / "transforms.json")
     output_path = write_frame_detail(scene_root, transforms, args.frame_index)
+    metadata_dir = scene_root / "metadata"
+    metadata_dir.mkdir(exist_ok=True)
+
+    # Set DB path to per-scene if not provided
+    if args.sqlite is None:
+        db_path = metadata_dir / "splatdb_meta.db"
+    else:
+        db_path = args.sqlite.resolve()
+
     if args.sqlite:
-        db = SceneDatabase(args.sqlite.resolve())
+        db = SceneDatabase(db_path)
         scene_id = db.upsert_scene(
             name=scene_root.name,
             scene_root=scene_root,
@@ -935,20 +1247,85 @@ def build_parser() -> argparse.ArgumentParser:
     harvest.add_argument("--schema", type=str, default="splatdb-0.3.0")
     harvest.add_argument("--margin", type=float, default=1.25)
     harvest.add_argument("--coverage", type=float, default=0.18)
-    harvest.add_argument("--sqlite", type=Path, default=Path("metadata/splatdb_meta.db"))
+    harvest.add_argument("--sqlite", type=Path, default=None, help="Path to SQLite DB. Defaults to {output}/metadata/splatdb_meta.db")
+    harvest.add_argument("--enable-depth", action="store_true", help="Enable depth path placeholders")
+    harvest.add_argument("--enable-normals", action="store_true", help="Enable normals path placeholders")
+    harvest.add_argument("--enable-albedo", action="store_true", help="Enable albedo path placeholders")
+    harvest.add_argument("--render", action="store_true", help="Render images using Blender after harvest")
+    harvest.add_argument(
+        "--render-engine",
+        type=str,
+        choices=["eevee", "cycles"],
+        default="eevee",
+        help="Render engine for Blender output (default: eevee)",
+    )
+    harvest.add_argument(
+        "--render-samples",
+        type=int,
+        default=64,
+        help="Sample count for renders (Eevee TAA samples or Cycles path samples)",
+    )
+    harvest.add_argument("--render-sun-energy", type=float, default=5.0, help="Sun lamp energy")
+    harvest.add_argument(
+        "--render-sun-azimuth",
+        type=float,
+        default=45.0,
+        help="Sun azimuth in degrees (rotation around Z)",
+    )
+    harvest.add_argument(
+        "--render-sun-elevation",
+        type=float,
+        default=35.0,
+        help="Sun elevation in degrees above the horizon",
+    )
+    harvest.add_argument(
+        "--render-env-strength",
+        type=float,
+        default=0.5,
+        help="Strength of the ambient environment light",
+    )
+    harvest.add_argument(
+        "--render-env-color",
+        type=float,
+        nargs=3,
+        metavar=("R", "G", "B"),
+        default=(0.6, 0.62, 0.65),
+        help="Ambient environment tint color when no HDRI is provided",
+    )
+    harvest.add_argument(
+        "--render-hdri",
+        type=Path,
+        default=None,
+        help="Optional HDRI texture to light the scene",
+    )
+    harvest.add_argument(
+        "--render-denoise",
+        action="store_true",
+        help="Enable denoising when rendering with Cycles",
+    )
     harvest.set_defaults(func=harvest_scene)
 
-    preview = sub.add_parser("preview", help="Generate MP4 previews for a dataset")
+    preview = sub.add_parser("preview", help="Generate previews for a dataset")
     preview.add_argument("scene_root", type=Path, help="Path to the scene directory")
-    preview.add_argument("--output", type=Path, default=None)
-    preview.add_argument("--fps", type=int, default=24)
-    preview.add_argument("--sqlite", type=Path, default=None)
+    preview.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Directory for generated previews (default: data/{scene_name})",
+    )
+    preview.add_argument("--fps", type=int, default=24, help="Frames per second for video outputs")
+    preview.add_argument("--sqlite", type=Path, default=None, help="Path to SQLite DB. Defaults to {scene_root}/metadata/splatdb_meta.db")
+    preview.add_argument("--num-images", type=int, default=None, help="Generate up to this many PNG previews per requested modality instead of MP4 video")
+    preview.add_argument("--rgb", action="store_true", help="Generate RGB previews")
+    preview.add_argument("--depth", action="store_true", help="Generate depth previews")
+    preview.add_argument("--normal", action="store_true", help="Generate normal previews")
+    preview.add_argument("--normals", dest="normal", action="store_true", help=argparse.SUPPRESS)
     preview.set_defaults(func=preview_command)
 
     frame = sub.add_parser("frame-detail", help="Export metadata for a single frame")
     frame.add_argument("scene_root", type=Path, help="Path to the scene directory")
     frame.add_argument("frame_index", type=int, help="Frame index to export")
-    frame.add_argument("--sqlite", type=Path, default=None)
+    frame.add_argument("--sqlite", type=Path, default=None, help="Path to SQLite DB. Defaults to {scene_root}/metadata/splatdb_meta.db")
     frame.set_defaults(func=export_frame_detail_command)
 
     return parser
@@ -959,8 +1336,40 @@ def preview_command(args: argparse.Namespace) -> None:
     if not scene_root.exists():
         print(f"Scene directory not found: {scene_root}", file=sys.stderr)
         raise SystemExit(1)
-    output_dir = (args.output or (scene_root / "previews")).resolve()
-    build_previews(scene_root, output_dir, fps=args.fps, db_path=args.sqlite)
+    default_output = Path("data") / scene_root.name
+    output_dir = (args.output or default_output).resolve()
+    metadata_dir = scene_root / "metadata"
+    metadata_dir.mkdir(exist_ok=True)
+
+    if args.sqlite is None:
+        db_path = metadata_dir / "splatdb_meta.db"
+    else:
+        db_path = args.sqlite.resolve()
+
+    num_images = args.num_images
+    if num_images is not None and num_images <= 0:
+        num_images = None
+
+    preview_types = []
+    if getattr(args, "rgb", False):
+        preview_types.append("rgb")
+    if getattr(args, "depth", False):
+        preview_types.append("depth")
+    if getattr(args, "normal", False):
+        preview_types.append("normal")
+
+    if not preview_types:
+        print("At least one of --rgb, --depth, or --normal must be specified.", file=sys.stderr)
+        raise SystemExit(2)
+
+    build_previews(
+        scene_root,
+        output_dir,
+        fps=args.fps,
+        db_path=db_path,
+        preview_types=preview_types,
+        num_images=num_images,
+    )
 
 
 def main(argv: Optional[List[str]] = None) -> int:
