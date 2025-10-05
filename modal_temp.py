@@ -7,6 +7,8 @@ from typing import Optional, List
 import modal
 from modal import Image, Volume, gpu
 import argparse
+import zipfile
+import io
 
 app = modal.App("splats")
 
@@ -78,110 +80,57 @@ def sync_workspace():
         print(f"Done syncing {src}.")
 
 
-@app.local_entrypoint()
-def train_scene(
-    scene: str,
-    iters: int = 30000,
-    init_count: int = 50000,
-    lr_pos: float = 1e-2,
-    lr_other: float = 1e-3,
-    out_dir: str = "./out_local",
-    images_dir: str = "images_8"
-):
-    import sys
-    import os
-    repo_root = os.path.dirname(__file__)
-    train_src = os.path.join(repo_root, "3dgs")
-    if train_src not in sys.path:
-        sys.path.insert(0, train_src)
-    from train_local import main as train_main
 
-    scene_path = scene
-    if not os.path.isdir(scene_path):
-        candidate = os.path.join(repo_root, "scenes", scene)
-        if os.path.isdir(candidate):
-            scene_path = candidate
+@app.function(
+    image=image,
+    volumes={"/workspace": splats_wspace},
+)
+def zip_remote_dir(remote_dir: str = "/workspace/out_local_test") -> Optional[bytes]:
+    if not os.path.exists(remote_dir):
+        print(f"Remote path '{remote_dir}' not found")
+        return None
 
-    argv = [
-        "train_local",
-        "--scene", scene_path,
-        "--iters", str(iters),
-        "--init_count", str(init_count),
-        "--lr_pos", str(lr_pos),
-        "--lr_other", str(lr_other),
-        "--out", out_dir,
-        "--images_dir", images_dir,
-    ]
-
-    prev_argv = sys.argv
-    sys.argv = argv
-    try:
-        print(f"Starting local training for scene {scene}...")
-        train_main()
-    finally:
-        sys.argv = prev_argv
-    print("Training complete!")
-
-    remote_dir = out_dir if out_dir.startswith("/") else f"/{Path(out_dir).name}"
-    try:
-        sync_outputs(remote_dir=remote_dir, local_dir=out_dir, volume_name="workspace")
-    except subprocess.CalledProcessError as exc:
-        print(f"Sync attempt from '{remote_dir}' failed (skipping): {exc}")
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for root, dirs, files in os.walk(remote_dir):
+            for file in files:
+                file_path = os.path.join(root, file)
+                arcname = os.path.relpath(file_path, remote_dir)
+                zipf.write(file_path, arcname)
+    
+    zip_buffer.seek(0)
+    return zip_buffer.read()
 
 
 @app.local_entrypoint()
-def sync_outputs(
-    remote_dir: str = "/out_local",
-    local_dir: str = "./out_local",
-    volume_name: str = "workspace",
-    overwrite: bool = True,
-) -> None:
-    """Sync a directory from a Modal volume down to the local filesystem."""
-    remote_dir = remote_dir if remote_dir.startswith("/") else f"/{remote_dir}"
+def sync_outputs(local_dir: str = "./out_local"):
     local_path = Path(local_dir).expanduser().resolve()
-
-    check_cmd = ["modal", "volume", "ls", volume_name, remote_dir]
-    check = subprocess.run(check_cmd, capture_output=True, text=True)
-    if check.returncode != 0:
-        print(f"Remote path '{remote_dir}' not found on volume '{volume_name}'; skipping sync.")
+    
+    print(f"Downloading /workspace/out_local to {local_path}")
+    
+    zip_data = zip_remote_dir.remote()
+    
+    if not zip_data:
+        print("No data found at /workspace/out_local")
         return
-
-    if local_path.exists() and overwrite:
+    
+    if local_path.exists():
         shutil.rmtree(local_path)
     local_path.mkdir(parents=True, exist_ok=True)
+    
+    with zipfile.ZipFile(io.BytesIO(zip_data)) as zipf:
+        zipf.extractall(local_path)
+    
+    print(f"Downloaded to {local_path}")
 
-    cmd = ["modal", "volume", "get", volume_name, remote_dir, str(local_path)]
-    print(f"Running: {' '.join(cmd)}")
-    subprocess.run(cmd, check=True)
-    print(f"Synced {remote_dir} from volume '{volume_name}' to {local_path}.")
 
 
-@app.local_entrypoint()
-def test_sync_outputs(volume_name: str = "workspace") -> None:
-    """Exercise sync_outputs by syncing a temporary directory containing a hello-world file."""
-    remote_test_dir = "/sync_outputs_test"
-    local_test_dir = Path("./test_synced").resolve()
 
-    temp_dir = Path(tempfile.mkdtemp(prefix="modal_sync_src_"))
-    test_file = temp_dir / "hello.txt"
-    test_file.write_text("hello world\n")
-
-    subprocess.run(
-        ["modal", "volume", "rm", "--recursive", volume_name, remote_test_dir],
-        check=False,
-    )
-    subprocess.run(
-        ["modal", "volume", "put", volume_name, str(temp_dir), remote_test_dir],
-        check=True,
-    )
-
-    if local_test_dir.exists():
-        shutil.rmtree(local_test_dir)
-
-    sync_outputs(remote_dir=remote_test_dir, local_dir=str(local_test_dir), volume_name=volume_name)
-
-    synced_file = next(local_test_dir.rglob("hello.txt"), None)
-    if not synced_file:
-        raise RuntimeError("hello.txt not found after syncing; ensure modal CLI access is configured")
-
-    print(f"Test sync succeeded; file located at {synced_file}")
+@app.function(
+    image=image,
+    volumes={"/workspace": splats_wspace},
+)
+def shell():
+    import sys
+    import subprocess
+    subprocess.call(["/bin/bash"], stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr)
