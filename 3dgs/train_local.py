@@ -252,8 +252,8 @@ def densify_and_prune(means, scales, quats, opacity, colors, grad_threshold=0.00
     
     return means, scales, quats, opacity, colors
 
-def save_checkpoint(scene, step, means, scales, quats, opacity, colors, out_dir):
-    ckpt_dir = os.path.join(out_dir, "checkpoints", scene)
+def save_checkpoint(scene_stub, step, means, scales, quats, opacity, colors, out_dir):
+    ckpt_dir = os.path.join(out_dir, "checkpoints", scene_stub)
     os.makedirs(ckpt_dir, exist_ok=True)
     ckpt = {
         "step": step,
@@ -275,6 +275,7 @@ def main():
     ap.add_argument("--out", type=str, default="./out_local")
     ap.add_argument("--images_dir", type=str, default="images_8", help="subdirectory with training images or 'auto'")
     args = ap.parse_args()
+    scene_stub = os.path.basename(os.path.normpath(args.scene))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     images_dir = None if args.images_dir == "auto" else args.images_dir
     ds = GardenDataset(args.scene, images_dir=images_dir)
@@ -313,9 +314,9 @@ def main():
     ckpt_interval = 1000
     decay_interval = 7000
     render_interval = 100
-    ckpt_dir = os.path.join(args.out, "checkpoints", args.scene)
+    ckpt_dir = os.path.join(args.out, "checkpoints", scene_stub)
     os.makedirs(ckpt_dir, exist_ok=True)
-    log_path = os.path.join(ckpt_dir, "log.txt")
+    log_path = os.path.join(args.out, "log.txt")
     while step < args.iters:
         for batch in dl:
             img = batch["image"].to(device).squeeze(0)
@@ -366,14 +367,14 @@ def main():
                 with torch.no_grad():
                     scales = relu(scales - 0.0025)
             if step % ckpt_interval == 0:
-                save_checkpoint(args.scene, step, means, scales, quats, opacity, colors, args.out)
+                save_checkpoint(scene_stub, step, means, scales, quats, opacity, colors, args.out)
             if step >= args.iters:
                 break
     # Final render
     pred_final = render_dgr(dgr, means, scales, quats, opacity, colors, K0, cam0["c2w"].to(device), cam0["W"], cam0["H"])
     save_png(pred_final, os.path.join(args.out, "final_render.png"))
     # Final checkpoint
-    save_checkpoint(args.scene, step, means, scales, quats, opacity, colors, args.out)
+    save_checkpoint(scene_stub, step, means, scales, quats, opacity, colors, args.out)
     print(f"Training complete. Final Gaussians: {means.shape[0]}")
 
 if __name__ == "__main__":
