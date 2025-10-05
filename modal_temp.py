@@ -85,37 +85,37 @@ def sync_workspace():
     volumes={"/workspace": splats_wspace},
 )
 def install_all():
-    import sys, os, subprocess; sys.path.insert(0, "/workspace/3dgs")
+    import sys, os, subprocess, pathlib
+    sys.path.insert(0, "/workspace/3dgs")
 
-    # Create virtual environment in workspace volume
     venv_path = "/workspace/venv"
+    py_bin = "/opt/conda/bin/python"
     if not os.path.exists(venv_path):
-        subprocess.run(["python", "-m", "venv", venv_path])
+        subprocess.run([py_bin, "-m", "venv", venv_path], check=True)
 
-    # Set up environment for venv activation
     venv_env = os.environ.copy()
     venv_env["PATH"] = f"{venv_path}/bin:" + venv_env.get("PATH", "")
     venv_env["VIRTUAL_ENV"] = venv_path
 
+    pyver = subprocess.check_output([py_bin, "-c", "import sys;print(f'{sys.version_info.major}.{sys.version_info.minor}')"]).decode().strip()
+    site_packages = f"{venv_path}/lib/python{pyver}/site-packages"
+    pathlib.Path(site_packages).mkdir(parents=True, exist_ok=True)
+    with open(os.path.join(site_packages, "_conda_site.pth"), "w") as f:
+        f.write(f"/opt/conda/lib/python{pyver}/site-packages\n")
+
     os.chdir("/workspace/3dgs")
-    subprocess.run(["uv", "pip", "install", "-r", "requirements.txt"], env=venv_env)
+    subprocess.run(["uv", "pip", "install", "-r", "requirements.txt"], env=venv_env, check=True)
 
     os.chdir("/workspace/diff-gaussian-rasterization")
-    sys.path.insert(0, "/workspace/diff-gaussian-rasterization")
+    subprocess.run(["uv", "pip", "install", "wheel"], env=venv_env, check=True)
+    subprocess.run(["rm", "-rf", "build"], check=False)
 
-    # Install wheel package which is needed for building
-    subprocess.run(["uv", "pip", "install", "wheel"], env=venv_env)
-
-    # Build with venv's python but access to system's torch
     build_env = venv_env.copy()
-    build_env["TORCH_CUDA_ARCH_LIST"] = "8.0"  # A100 compute capability
-    # Include system packages in PYTHONPATH so torch is available during build
-    build_env["PYTHONPATH"] = f"/opt/conda/lib/python3.11/site-packages:{venv_path}/lib/python3.11/site-packages"
-
-    # Use venv's pip to install, which will use venv's python but have access to system torch
+    build_env["TORCH_CUDA_ARCH_LIST"] = "8.0"
     subprocess.run([
-        f"{venv_path}/bin/pip", "install", "--no-build-isolation", "-e", "."
-    ], env=build_env, cwd="/workspace/diff-gaussian-rasterization")
+        "uv", "pip", "install", "--python", f"{venv_path}/bin/python",
+        "--no-build-isolation", "."
+    ], env=build_env, cwd="/workspace/diff-gaussian-rasterization", check=True)
 
     splats_wspace.commit()
 
@@ -170,13 +170,26 @@ def sync_outputs(local_dir: str = "./out_local"):
     timeout=3600,
 )
 def train():
-    import sys, os
-
-    # Activate virtual environment
+    import sys, os, glob, site
     venv_path = "/workspace/venv"
     os.environ["PATH"] = f"{venv_path}/bin:" + os.environ.get("PATH", "")
     os.environ["VIRTUAL_ENV"] = venv_path
-    sys.path.insert(0, f"{venv_path}/lib/python3.11/site-packages")
+    try:
+        venv_site = sorted(glob.glob(f"{venv_path}/lib/python*/site-packages"))[-1]
+        site.addsitedir(venv_site)
+    except Exception:
+        pass
+    try:
+        conda_site = sorted(glob.glob("/opt/conda/lib/python*/site-packages"))[-1]
+        site.addsitedir(conda_site)
+    except Exception:
+        pass
+    try:
+        for p in glob.glob("/workspace/diff-gaussian-rasterization/build/lib.*"):
+            if p not in sys.path:
+                sys.path.insert(0, p)
+    except Exception:
+        pass
 
     scene = "garden"
     iters = 30000
@@ -214,6 +227,7 @@ def train():
 @app.local_entrypoint()
 def train_and_sync():
     print("Starting remote training...")
+    install_all.remote()
     train.remote()
     
     print("\nSyncing outputs to local...")
