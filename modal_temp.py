@@ -80,12 +80,51 @@ def sync_workspace():
         print(f"Done syncing {src}.")
 
 
-
 @app.function(
     image=image,
     volumes={"/workspace": splats_wspace},
 )
-def zip_remote_dir(remote_dir: str = "/workspace/out_local_test") -> Optional[bytes]:
+def install_all():
+    import sys, os, subprocess; sys.path.insert(0, "/workspace/3dgs")
+
+    # Create virtual environment in workspace volume
+    venv_path = "/workspace/venv"
+    if not os.path.exists(venv_path):
+        subprocess.run(["python", "-m", "venv", venv_path])
+
+    # Set up environment for venv activation
+    venv_env = os.environ.copy()
+    venv_env["PATH"] = f"{venv_path}/bin:" + venv_env.get("PATH", "")
+    venv_env["VIRTUAL_ENV"] = venv_path
+
+    os.chdir("/workspace/3dgs")
+    subprocess.run(["uv", "pip", "install", "-r", "requirements.txt"], env=venv_env)
+
+    os.chdir("/workspace/diff-gaussian-rasterization")
+    sys.path.insert(0, "/workspace/diff-gaussian-rasterization")
+
+    # Install wheel package which is needed for building
+    subprocess.run(["uv", "pip", "install", "wheel"], env=venv_env)
+
+    # Build with venv's python but access to system's torch
+    build_env = venv_env.copy()
+    build_env["TORCH_CUDA_ARCH_LIST"] = "8.0"  # A100 compute capability
+    # Include system packages in PYTHONPATH so torch is available during build
+    build_env["PYTHONPATH"] = f"/opt/conda/lib/python3.11/site-packages:{venv_path}/lib/python3.11/site-packages"
+
+    # Use venv's pip to install, which will use venv's python but have access to system torch
+    subprocess.run([
+        f"{venv_path}/bin/pip", "install", "--no-build-isolation", "-e", "."
+    ], env=build_env, cwd="/workspace/diff-gaussian-rasterization")
+
+    splats_wspace.commit()
+
+    
+@app.function(
+    image=image,
+    volumes={"/workspace": splats_wspace},
+)
+def zip_remote_dir(remote_dir: str = "/workspace/out_local") -> Optional[bytes]:
     if not os.path.exists(remote_dir):
         print(f"Remote path '{remote_dir}' not found")
         return None
@@ -122,6 +161,78 @@ def sync_outputs(local_dir: str = "./out_local"):
         zipf.extractall(local_path)
     
     print(f"Downloaded to {local_path}")
+
+
+@app.function(
+    image=image,
+    gpu="A100",
+    volumes={"/workspace": splats_wspace},
+    timeout=3600,
+)
+def train():
+    import sys, os
+
+    # Activate virtual environment
+    venv_path = "/workspace/venv"
+    os.environ["PATH"] = f"{venv_path}/bin:" + os.environ.get("PATH", "")
+    os.environ["VIRTUAL_ENV"] = venv_path
+    sys.path.insert(0, f"{venv_path}/lib/python3.11/site-packages")
+
+    scene = "garden"
+    iters = 30000
+    init_count = 50000
+    lr_pos = 1e-2
+    lr_other = 1e-3
+    images_dir = "images_8"
+    out_dir = "/workspace/out_local"
+
+    train_src = "/workspace/3dgs"
+    sys.path.insert(0, train_src)
+    from train_local import main as train_main
+    
+    scene_path = f"/workspace/scenes/{scene}"
+    
+    sys.argv = [
+        "train_local",
+        "--scene", scene_path,
+        "--iters", str(iters),
+        "--init_count", str(init_count),
+        "--lr_pos", str(lr_pos),
+        "--lr_other", str(lr_other),
+        "--out", out_dir,
+        "--images_dir", images_dir,
+    ]
+    
+    print(f"Starting training: {scene} for {iters} iters on A100")
+    train_main()
+    print("Training complete!")
+    
+    splats_wspace.commit()
+    print("Volume committed")
+
+
+@app.local_entrypoint()
+def train_and_sync():
+    print("Starting remote training...")
+    train.remote()
+    
+    print("\nSyncing outputs to local...")
+    local_path = Path("./out_local").expanduser().resolve()
+
+    zip_data = zip_remote_dir.remote("/workspace/out_local")
+    
+    if not zip_data:
+        print("No data found at /workspace/out_local")
+        return
+    
+    if local_path.exists():
+        shutil.rmtree(local_path)
+    local_path.mkdir(parents=True, exist_ok=True)
+    
+    with zipfile.ZipFile(io.BytesIO(zip_data)) as zipf:
+        zipf.extractall(local_path)
+    
+    print(f"Done! Outputs in {local_path}")
 
 
 
