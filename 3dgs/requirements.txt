@@ -9,3 +9,4 @@ networkx
 pygltflib
 matplotlib
 rtree
+modal

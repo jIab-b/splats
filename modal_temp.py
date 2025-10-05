@@ -60,39 +60,50 @@ GPU      = {"L4": "L4", "L40S": "L40S", "A100": "A100-40GB", "H100": "H100"}.get
 
 
 @app.local_entrypoint()
-def sync_workspace(**kwargs):
+def sync_workspace():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dir", action="append", default=[], help="Additional directories to sync to workspace (defaults to ['3dgs', 'diff-gaussian-rasterization'] if none provided)")
-    args, unknown = parser.parse_known_args(kwargs.values())
+    args, unknown = parser.parse_known_args()
     dirs_to_sync = args.dir
     if not dirs_to_sync:
         dirs_to_sync = ['3dgs', 'diff-gaussian-rasterization']
     for src in dirs_to_sync:
-        dest = f"/workspace/{os.path.basename(src)}"
+        dest = f"/{os.path.basename(src)}"
         print(f"Syncing {src} -> {dest} ...")
+        # Delete remote dir if exists to allow overwrite
+        subprocess.run(["modal", "volume", "rm", "--recursive", "workspace", dest], check=False)  # Ignore if not exists
         subprocess.run(["modal", "volume", "put", "workspace", src, dest], check=True)
         print(f"Done syncing {src}.")
 
 
-
-
-
-
-
-@app.function(
-    image=image,
-    gpu=GPU,
-    volumes={"/workspace": splats_wspace},
-    timeout=30 * 60,
-)
-def buil_source():
-    import subprocess
+@app.local_entrypoint()
+def train_scene(
+    scene: str,
+    iters: int = 30000,
+    init_count: int = 50000,
+    lr_pos: float = 1e-2,
+    lr_other: float = 1e-3,
+    out_dir: str = "./out_local",
+    images_dir: str = "images_8"
+):
     import sys
+    import os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "3dgs"))
+    from train_local import main as train_main
+    import argparse
 
-    subprocess.run([sys.executable, "-m", "uv", "pip", "install", "-r", "/workspace/3dgs/requirements.txt"], cwd="/workspace", check=True)
-    print("Installed requirements from 3dgs/requirements.txt")
+    # Create args for training
+    args = argparse.Namespace(
+        scene=scene,
+        iters=iters,
+        init_count=init_count,
+        lr_pos=lr_pos,
+        lr_other=lr_other,
+        out=out_dir,
+        images_dir=images_dir
+    )
 
-    subprocess.run([sys.executable, "-m", "uv", "pip", "install", "-e", "/workspace/diff-gaussian-rasterization"], cwd="/workspace", check=True)
-    print("Installed diff-gaussian-rasterization from source")
+    print(f"Starting local training for scene {scene}...")
+    train_main(args)
+    print("Training complete!")
 
-    print("Build complete")
