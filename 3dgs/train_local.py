@@ -3,7 +3,10 @@ from torch.utils.data import DataLoader
 from torch.optim import Adam
 from torch.nn.functional import relu
 from PIL import Image
-from .data import GardenDataset
+try:
+    from .data import GardenDataset
+except ImportError:  # Fallback when module is imported outside package context
+    from data import GardenDataset
 
 def _ensure_dgr():
     try:

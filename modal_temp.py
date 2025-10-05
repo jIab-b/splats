@@ -1,5 +1,7 @@
 # modal_app.py
 import os, signal, subprocess, json, shutil
+import tempfile
+from pathlib import Path
 from datetime import datetime
 from typing import Optional, List
 import modal
@@ -88,22 +90,98 @@ def train_scene(
 ):
     import sys
     import os
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "3dgs"))
+    repo_root = os.path.dirname(__file__)
+    train_src = os.path.join(repo_root, "3dgs")
+    if train_src not in sys.path:
+        sys.path.insert(0, train_src)
     from train_local import main as train_main
-    import argparse
 
-    # Create args for training
-    args = argparse.Namespace(
-        scene=scene,
-        iters=iters,
-        init_count=init_count,
-        lr_pos=lr_pos,
-        lr_other=lr_other,
-        out=out_dir,
-        images_dir=images_dir
-    )
+    scene_path = scene
+    if not os.path.isdir(scene_path):
+        candidate = os.path.join(repo_root, "scenes", scene)
+        if os.path.isdir(candidate):
+            scene_path = candidate
 
-    print(f"Starting local training for scene {scene}...")
-    train_main(args)
+    argv = [
+        "train_local",
+        "--scene", scene_path,
+        "--iters", str(iters),
+        "--init_count", str(init_count),
+        "--lr_pos", str(lr_pos),
+        "--lr_other", str(lr_other),
+        "--out", out_dir,
+        "--images_dir", images_dir,
+    ]
+
+    prev_argv = sys.argv
+    sys.argv = argv
+    try:
+        print(f"Starting local training for scene {scene}...")
+        train_main()
+    finally:
+        sys.argv = prev_argv
     print("Training complete!")
 
+    remote_dir = out_dir if out_dir.startswith("/") else f"/{Path(out_dir).name}"
+    try:
+        sync_outputs(remote_dir=remote_dir, local_dir=out_dir, volume_name="workspace")
+    except subprocess.CalledProcessError as exc:
+        print(f"Sync attempt from '{remote_dir}' failed (skipping): {exc}")
+
+
+@app.local_entrypoint()
+def sync_outputs(
+    remote_dir: str = "/out_local",
+    local_dir: str = "./out_local",
+    volume_name: str = "workspace",
+    overwrite: bool = True,
+) -> None:
+    """Sync a directory from a Modal volume down to the local filesystem."""
+    remote_dir = remote_dir if remote_dir.startswith("/") else f"/{remote_dir}"
+    local_path = Path(local_dir).expanduser().resolve()
+
+    check_cmd = ["modal", "volume", "ls", volume_name, remote_dir]
+    check = subprocess.run(check_cmd, capture_output=True, text=True)
+    if check.returncode != 0:
+        print(f"Remote path '{remote_dir}' not found on volume '{volume_name}'; skipping sync.")
+        return
+
+    if local_path.exists() and overwrite:
+        shutil.rmtree(local_path)
+    local_path.mkdir(parents=True, exist_ok=True)
+
+    cmd = ["modal", "volume", "get", volume_name, remote_dir, str(local_path)]
+    print(f"Running: {' '.join(cmd)}")
+    subprocess.run(cmd, check=True)
+    print(f"Synced {remote_dir} from volume '{volume_name}' to {local_path}.")
+
+
+@app.local_entrypoint()
+def test_sync_outputs(volume_name: str = "workspace") -> None:
+    """Exercise sync_outputs by syncing a temporary directory containing a hello-world file."""
+    remote_test_dir = "/sync_outputs_test"
+    local_test_dir = Path("./test_synced").resolve()
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="modal_sync_src_"))
+    test_file = temp_dir / "hello.txt"
+    test_file.write_text("hello world\n")
+
+    subprocess.run(
+        ["modal", "volume", "rm", "--recursive", volume_name, remote_test_dir],
+        check=False,
+    )
+    subprocess.run(
+        ["modal", "volume", "put", volume_name, str(temp_dir), remote_test_dir],
+        check=True,
+    )
+
+    if local_test_dir.exists():
+        shutil.rmtree(local_test_dir)
+
+    sync_outputs(remote_dir=remote_test_dir, local_dir=str(local_test_dir), volume_name=volume_name)
+
+    synced_file = next(local_test_dir.rglob("hello.txt"), None)
+    if not synced_file:
+        raise RuntimeError("hello.txt not found after syncing; ensure modal CLI access is configured")
+
+    print(f"Test sync succeeded; file located at {synced_file}")
