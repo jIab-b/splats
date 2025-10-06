@@ -175,6 +175,33 @@ def render_dgr(dgr, means, scales, quats, opacity, colors, sh_coeffs, sh_degree,
 def l2(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return torch.mean((a - b) ** 2)
 
+def _gaussian_window(window_size: int, sigma: float, device, dtype):
+    coords = torch.arange(window_size, device=device, dtype=dtype) - window_size // 2
+    g = torch.exp(-(coords ** 2) / (2 * sigma * sigma))
+    g = (g / g.sum()).view(1, 1, -1)
+    window = g.transpose(2, 1) @ g
+    return window
+
+def ssim(img1: torch.Tensor, img2: torch.Tensor, window_size: int = 11, sigma: float = 1.5):
+    if img1.dim() == 3:
+        img1 = img1.unsqueeze(0)
+        img2 = img2.unsqueeze(0)
+    C1 = 0.01 ** 2
+    C2 = 0.03 ** 2
+    b, c, h, w = img1.shape
+    window = _gaussian_window(window_size, sigma, img1.device, img1.dtype)
+    window = window.expand(c, 1, window_size, window_size)
+    mu1 = torch.nn.functional.conv2d(img1, window, padding=window_size // 2, groups=c)
+    mu2 = torch.nn.functional.conv2d(img2, window, padding=window_size // 2, groups=c)
+    mu1_sq = mu1 * mu1
+    mu2_sq = mu2 * mu2
+    mu1_mu2 = mu1 * mu2
+    sigma1_sq = torch.nn.functional.conv2d(img1 * img1, window, padding=window_size // 2, groups=c) - mu1_sq
+    sigma2_sq = torch.nn.functional.conv2d(img2 * img2, window, padding=window_size // 2, groups=c) - mu2_sq
+    sigma12 = torch.nn.functional.conv2d(img1 * img2, window, padding=window_size // 2, groups=c) - mu1_mu2
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2) + 1e-8)
+    return ssim_map.mean()
+
 def save_png(t: torch.Tensor, path: str):
     td = t.detach()
     if td.dim() == 3 and td.shape[0] == 3:
@@ -183,7 +210,7 @@ def save_png(t: torch.Tensor, path: str):
         img = torch.clamp(td, 0, 1).cpu().numpy()
     Image.fromarray((img * 255.0).astype(np.uint8)).save(path)
 
-def densify_and_prune(means, scales, quats, opacity, colors, sh_coeffs=None, sh_degree=0, grad_threshold=0.00016, prune_threshold=0.02, add_new=250, max_gaussians=1000000, clone_max=50000):
+def densify_and_prune(means, scales, quats, opacity, colors, sh_coeffs=None, sh_degree=0, grad_threshold=0.00016, prune_threshold=0.02, add_new=250, max_gaussians=1000000, clone_max=50000, grad_scores: torch.Tensor | None = None, grad_score_threshold: float = 0.0):
     # Detach inputs to break history after opt.step
     means = means.detach().requires_grad_(True)
     scales = scales.detach().requires_grad_(True)
@@ -211,8 +238,15 @@ def densify_and_prune(means, scales, quats, opacity, colors, sh_coeffs=None, sh_
     if sh_coeffs is not None and sh_degree and sh_degree > 0:
         sh_coeffs = sh_coeffs.detach().requires_grad_(True)
     
-    large_scale_mask = (scales.max(dim=1)[0] > 0.01).squeeze()
-    clone_idx = torch.nonzero(large_scale_mask).flatten()
+    if grad_scores is not None:
+        sel = grad_scores > float(grad_score_threshold)
+        clone_idx = torch.nonzero(sel).flatten()
+        if clone_idx.numel() > 0:
+            order = torch.argsort(grad_scores[clone_idx], descending=True)
+            clone_idx = clone_idx[order]
+    else:
+        large_scale_mask = (scales.max(dim=1)[0] > 0.01).squeeze()
+        clone_idx = torch.nonzero(large_scale_mask).flatten()
     if clone_idx.numel() > 0:
         room = max(0, int(max_gaussians - means.shape[0]))
         allow = min(room, int(clone_max)) if clone_max is not None else room
@@ -408,12 +442,16 @@ def main():
                 img = torch.nn.functional.interpolate(img.unsqueeze(0), size=(Hds, Wds), mode="bilinear", align_corners=False).squeeze(0)
                 with torch.cuda.amp.autocast(enabled=use_amp):
                     pred = render_dgr(dgr, means, scales, quats, opacity, colors, sh_coeffs, args.sh_degree, not args.no_prefilter, K, cam["c2w"], Wds, Hds)
-                    loss = l2(pred, img) + 1e-3 * (scales ** 2).mean() + 1e-3 * (opacity.clamp(0,1) ** 2).mean()
+                    loss_l1 = torch.mean(torch.abs(pred - img))
+                    loss_ssim = 1.0 - ssim(pred.unsqueeze(0), img.unsqueeze(0))
+                    loss = 0.85 * loss_l1 + 0.15 * loss_ssim + 1e-3 * (scales ** 2).mean() + 1e-4 * (opacity.clamp(0,1) ** 2).mean()
             else:
                 K = build_K(cam, device)
                 with torch.cuda.amp.autocast(enabled=use_amp):
                     pred = render_dgr(dgr, means, scales, quats, opacity, colors, sh_coeffs, args.sh_degree, not args.no_prefilter, K, cam["c2w"], cam["W"], cam["H"])
-                    loss = l2(pred, img) + 1e-3 * (scales ** 2).mean() + 1e-3 * (opacity.clamp(0,1) ** 2).mean()
+                    loss_l1 = torch.mean(torch.abs(pred - img))
+                    loss_ssim = 1.0 - ssim(pred.unsqueeze(0), img.unsqueeze(0))
+                    loss = 0.85 * loss_l1 + 0.15 * loss_ssim + 1e-3 * (scales ** 2).mean() + 1e-4 * (opacity.clamp(0,1) ** 2).mean()
             opt.zero_grad()
             scaler.scale(loss).backward()
             clamp_params(scales, opacity)
@@ -454,6 +492,14 @@ def main():
                         save_png(pred_view, os.path.join(iter_dir, f"view_{idx}.png"))
             # Densify and prune every densify_interval
             if step % densify_interval == 0 and step > 0:
+                with torch.no_grad():
+                    grad_scores = None
+                    try:
+                        if means.grad is not None:
+                            g = means.grad
+                            grad_scores = torch.norm(g, dim=1)
+                    except Exception:
+                        grad_scores = None
                 means, scales, quats, opacity, colors, sh_coeffs = densify_and_prune(
                     means, scales, quats, opacity, colors, sh_coeffs,
                     sh_degree=args.sh_degree,
@@ -461,6 +507,8 @@ def main():
                     add_new=args.densify_add,
                     max_gaussians=max_gaussians,
                     clone_max=args.clone_max,
+                    grad_scores=grad_scores,
+                    grad_score_threshold=float(torch.quantile(grad_scores, 0.8).item()) if grad_scores is not None else 0.0,
                 )
                 # Recreate optimizer with decayed LR
                 decay_factor = 0.5 ** (step // decay_interval)
