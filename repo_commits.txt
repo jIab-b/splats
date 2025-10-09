@@ -1,0 +1,6 @@
+nerfstudio (branch splatfacto-refactor): 78de76d28da70964d7f9745376a4b9479ff18975
+gaussian-splatting: 54c035f7834b564019656c3e3fcc3646292f727d
+dreamgaussian: 69a3c7065d580da124dc0bf2e9a21cd3b7973b35
+stable-dreamfusion: 5550b91862a3af7842bb04875b7f1211e5095a63
+dust3r: 4c24a6ebf04809f2cfe59915e51779c8984aaa40
+Depth-Anything: 1d03336771fe09c5398ffdd211441e33941a97dc
