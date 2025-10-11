@@ -73,7 +73,7 @@ def sync_workspace():
     args, unknown = parser.parse_known_args()
     dirs_to_sync = args.dir
     if not dirs_to_sync:
-        dirs_to_sync = ['zero123plus']
+        dirs_to_sync = ['zero123plus', 'images']
         #dirs_to_sync = ['images']
     for src in dirs_to_sync:
         dest = f"/{os.path.basename(src)}"
@@ -194,6 +194,7 @@ def inference():
 
 @app.local_entrypoint()
 def run_inference():
+    sync_workspace()
     inference.remote()
     sync_outputs()
 
